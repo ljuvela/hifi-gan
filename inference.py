@@ -5,10 +5,10 @@ import os
 import argparse
 import json
 import torch
-from scipy.io.wavfile import write
 from env import AttrDict
 from meldataset import mel_spectrogram, MAX_WAV_VALUE, load_wav
 from models import Generator
+import soundfile as sf
 
 h = None
 device = None
@@ -49,16 +49,14 @@ def inference(a):
     with torch.no_grad():
         for i, filname in enumerate(filelist):
             wav, sr = load_wav(os.path.join(a.input_wavs_dir, filname))
-            wav = wav / MAX_WAV_VALUE
             wav = torch.FloatTensor(wav).to(device)
             x = get_mel(wav.unsqueeze(0))
             y_g_hat = generator(x)
             audio = y_g_hat.squeeze()
-            audio = audio * MAX_WAV_VALUE
-            audio = audio.cpu().numpy().astype('int16')
+            audio = audio.cpu().numpy()
 
             output_file = os.path.join(a.output_dir, os.path.splitext(filname)[0] + '_generated.wav')
-            write(output_file, h.sampling_rate, audio)
+            sf.write(output_file, audio, sr)
             print(output_file)
 
 

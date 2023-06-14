@@ -4,15 +4,16 @@ import random
 import torch
 import torch.utils.data
 import numpy as np
-from librosa.util import normalize
-from scipy.io.wavfile import read
-from librosa.filters import mel as librosa_mel_fn
+import soundfile as sf
+
+import torchaudio
 
 MAX_WAV_VALUE = 32768.0
 
 
 def load_wav(full_path):
-    sampling_rate, data = read(full_path)
+    data, sampling_rate = sf.read(full_path)
+    # sampling_rate, data = read(full_path)
     return data, sampling_rate
 
 
@@ -54,7 +55,16 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
 
     global mel_basis, hann_window
     if fmax not in mel_basis:
-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
+        mspec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sampling_rate,
+            n_fft=n_fft,
+            f_min=fmin,
+            f_max=fmax,
+            n_mels=num_mels,
+            norm='slaney',
+            mel_scale='slaney',
+        )
+        mel = mspec.mel_scale.fb.T.numpy()
         mel_basis[str(fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
         hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
 
@@ -112,10 +122,8 @@ class MelDataset(torch.utils.data.Dataset):
         filename = self.audio_files[index]
         if self._cache_ref_count == 0:
             audio, sampling_rate = load_wav(filename)
-            audio = audio / MAX_WAV_VALUE
-            if not self.fine_tuning:
-                audio = normalize(audio) * 0.95
             self.cached_wav = audio
+            # TODO: resample if needed
             if sampling_rate != self.sampling_rate:
                 raise ValueError("{} SR doesn't match target {} SR".format(
                     sampling_rate, self.sampling_rate))
