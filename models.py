@@ -270,6 +270,50 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
 
     return loss, r_losses, g_losses
 
+def discriminator_accuracy(disc_real_outputs, disc_generated_outputs):
+    """ 
+    Args:
+        disc_real_outputs: 
+            shape is (batch, channels, timesteps)
+        disc_generated_outputs
+            shape is (batch, channels, timesteps)
+    """
+    pred_real = []
+    pred_gen = []
+    # classifications for each discriminator
+    for d_real, d_gen in zip(disc_real_outputs, disc_generated_outputs):
+        
+        # mean prediction over time and channels
+        pred_real.append(torch.mean(d_real, dim=(-1,)) > 0.5)
+        pred_gen.append(torch.mean(d_gen, dim=(-1,)) < 0.5)
+
+    # Stack classifications from different discriminators
+    pred_real = torch.stack(pred_real, dim=0)
+    pred_gen = torch.stack(pred_gen, dim=0)
+
+    # Majority vote (probabilites not available)
+    pred_real_voted, _ = torch.median(pred_real * 1.0, dim=-1)
+    pred_gen_voted, _ = torch.median(pred_gen * 1.0, dim=-1)
+
+    if pred_real_voted.shape != pred_gen_voted.shape:
+        raise ValueError("Real and generated batch sizes must match")
+
+    N = pred_real_voted.shape[0]
+
+    # True Accept
+    TA = pred_real_voted.sum() 
+
+    # True Reject
+    TR = pred_gen_voted.sum()
+
+    # False Accept
+    FA = N - TR
+
+    # False Reject
+    FR = N - TA
+
+    return TA, TR, FA, FR, N
+
 
 def generator_loss(disc_outputs):
     loss = 0
