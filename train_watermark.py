@@ -16,7 +16,7 @@ from env import AttrDict, build_env
 from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
 from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
     discriminator_loss
-from models import discriminator_accuracy
+from metrics import DiscriminatorMetrics
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
 
 
@@ -39,18 +39,17 @@ def train(rank, a, h):
         device = torch.device('cpu')
 
     generator = Generator(h, input_channels=h.num_mels)
-    generator.pre_emphasis = Emphasis(alpha=h.pre_emph_coeff).to(device)
-    generator.lpc = LinearPredictor(
-            n_fft=h.n_fft,
-            hop_length=h.hop_size,
-            win_length=h.win_size,
-            order=h.allpole_order)
     generator = generator.to(device)
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
 
     mpd_watermark = MultiPeriodDiscriminator().to(device)
-    msd_watermark = MultiScaleDiscriminator().to)(device)
+    msd_watermark = MultiScaleDiscriminator().to(device)
+
+    mpd_adversary_metrics = DiscriminatorMetrics()
+    msd_adversary_metrics = DiscriminatorMetrics()
+    mpd_collab_metrics = DiscriminatorMetrics()
+    msd_collab_metrics = DiscriminatorMetrics()
 
     if rank == 0:
         print(generator)
@@ -60,6 +59,7 @@ def train(rank, a, h):
     if os.path.isdir(a.checkpoint_path):
         cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
         cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
+        cp_do_wm = scan_checkpoint(a.checkpoint_path, 'do_wm_') 
 
     steps = 0
     if cp_g is None or cp_do is None:
@@ -74,21 +74,39 @@ def train(rank, a, h):
         steps = state_dict_do['steps'] + 1
         last_epoch = state_dict_do['epoch']
 
+    if cp_do_wm is None:
+        state_dict_do_wm = None
+    else:
+        state_dict_do_wm = load_checkpoint(cp_do_wm, device)
+        mpd_watermark.load_state_dict(state_dict_do_wm['mpd'])
+        msd_watermark.load_state_dict(state_dict_do_wm['msd'])
+
     if h.num_gpus > 1:
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
         mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
         msd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
+        mpd_watermark = DistributedDataParallel(mpd_watermark, device_ids=[rank]).to(device)
+        msd_watermark = DistributedDataParallel(msd_watermark, device_ids=[rank]).to(device)
 
     optim_g = torch.optim.AdamW(generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
     optim_d = torch.optim.AdamW(itertools.chain(msd.parameters(), mpd.parameters()),
                                 h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+    optim_d_wm = torch.optim.AdamW(itertools.chain(msd_watermark.parameters(), mpd_watermark.parameters()), 
+                                h.learning_rate, betas=[h.adam_b1, h.adam_b2]) # TODO: lump with generator?
 
     if state_dict_do is not None:
         optim_g.load_state_dict(state_dict_do['optim_g'])
         optim_d.load_state_dict(state_dict_do['optim_d'])
 
+    if state_dict_do_wm is not None:
+        optim_d_wm.load_state_dict[state_dict_do_wm[['optim_d']]]
+    elif last_epoch > -1:
+        for pg in optim_d_wm.param_groups:
+            pg['initial_lr'] = pg['lr']
+
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
+    scheduler_d_wm = torch.optim.lr_scheduler.ExponentialLR(optim_d_wm, gamma=h.lr_decay, last_epoch=last_epoch)
 
     training_filelist, validation_filelist = get_dataset_filelist(a)
 
@@ -122,6 +140,8 @@ def train(rank, a, h):
     generator.train()
     mpd.train()
     msd.train()
+    mpd_watermark.train()
+    msd_watermark.train()
 
     # generator = torch.compile(generator)
     # mpd = torch.compile(mpd)
@@ -145,13 +165,8 @@ def train(rank, a, h):
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
             y = y.unsqueeze(1)
 
-            # estimate lpc coefficients
-            y_emph = generator.pre_emphasis.emphasis(y)
-            allpole = generator.lpc.estimate(y_emph[:, 0, :])
-            # generate excitation
-            e_g_hat = generator(x)
-            # apply synthesis filter
-            y_g_hat = generator.lpc.synthesis_filter(e_g_hat, allpole)
+
+            y_g_hat = generator(x)
 
             y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft,
                                           h.num_mels, h.sampling_rate,
@@ -159,38 +174,63 @@ def train(rank, a, h):
                                           h.fmin, h.fmax_for_loss)
 
             optim_d.zero_grad()
+            optim_d_wm.zero_grad()
 
             # MPD
             y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
-            # discriminator_accuracy(y_df_hat_r, y_df_hat_g)
             loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
-
+            # discriminator_metrics(y_df_hat_r, y_df_hat_g)
             # MSD
             y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
-            # discriminator_accuracy(y_ds_hat_r, y_ds_hat_g)
             loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
-
+            # discriminator_metrics(y_ds_hat_r, y_ds_hat_g)
             loss_disc_all = loss_disc_s + loss_disc_f
-
             loss_disc_all.backward()
             optim_d.step()
 
+            # # MPD Watermark
+            # y_df_hat_wm_r, y_df_hat_wm_g, _, _ = mpd_watermark(y, y_g_hat.detach())
+            # loss_disc_f_wm, losses_disc_f_wm_r, losses_disc_f_wm_g = discriminator_loss(
+            #     real=y_df_hat_r, generated = y_df_hat_g)
+            # # MSD Watermark
+            # y_ds_hat_wm_r, y_ds_hat_wm_g, _, _ = msd_watermark(y, y_g_hat.detach())
+            # loss_disc_s_wm, losses_disc_s_wm_r, losses_disc_s_wm_g = discriminator_loss(
+            #     real=y_ds_hat_r, generated=y_ds_hat_g)
+            # # Aggregate losses and apply optimization step
+            # loss_disc_wm_all = loss_disc_s_wm + loss_disc_f_wm
+            # loss_disc_wm_all.backward()
+            # optim_d_wm.step()
+
+
             # Generator
             optim_g.zero_grad()
+            optim_d_wm.zero_grad()
 
             # L1 Mel-Spectrogram Loss
             loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
 
+            # Adversary 
             y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
             y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
             loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
             loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
             loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
             loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
+
+            # Collaborator (watermark), Generator is aligned with Discriminator
+            y_df_hat_wm_r, y_df_hat_wm_g, _, _ = mpd_watermark(y, y_g_hat)
+            loss_disc_f_wm, losses_disc_f_wm_r, losses_disc_f_wm_g = discriminator_loss(
+                disc_real_outputs=y_df_hat_wm_r, disc_generated_outputs=y_df_hat_wm_g)
+            y_ds_hat_wm_r, y_ds_hat_wm_g, _, _ = msd_watermark(y, y_g_hat)
+            loss_disc_s_wm, losses_disc_s_wm_r, losses_disc_s_wm_g = discriminator_loss(
+                disc_real_outputs=y_ds_hat_wm_r, disc_generated_outputs=y_ds_hat_wm_g)
+
+            # Adversarial (S, F), Feature matching (S, F), Mel, Collaborative
+            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel + loss_disc_f_wm + loss_disc_s_wm
 
             loss_gen_all.backward()
             optim_g.step()
+            optim_d_wm.step()
 
             if rank == 0:
                 # STDOUT logging
@@ -214,6 +254,15 @@ def train(rank, a, h):
                                                          else msd).state_dict(),
                                      'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
                                      'epoch': epoch})
+                    checkpoint_path = "{}/do_wm_{:08d}".format(a.checkpoint_path, steps)
+                    save_checkpoint(checkpoint_path, 
+                                    {'mpd': (mpd_watermark.module if h.num_gpus > 1
+                                                         else mpd_watermark).state_dict(),
+                                     'msd': (msd_watermark.module if h.num_gpus > 1
+                                                         else msd_watermark).state_dict(),
+                                     'optim_d': optim_d_wm.state_dict()
+                                     })
+
 
                 # Tensorboard summary logging
                 if steps % a.summary_interval == 0:
@@ -233,22 +282,34 @@ def train(rank, a, h):
                     sw.add_scalar("training_gan/loss_fm_f", loss_fm_f, steps)
                     sw.add_scalar("training_gan/loss_fm_s", loss_fm_s, steps)
 
+                    # WATERMARK LOSSES
+                    # Framed Discriminator losses
+                    sw.add_scalar("training_watermark/disc_f_r", sum(losses_disc_f_wm_r), steps)
+                    sw.add_scalar("training_watermark/disc_f_g", sum(losses_disc_f_wm_g), steps)
+                    # Multiscale Discriminator losses
+                    sw.add_scalar("training_watermark/disc_s_r", sum(losses_disc_s_wm_r), steps)
+                    sw.add_scalar("training_watermark/disc_s_g", sum(losses_disc_s_wm_g), steps)
 
                 # Validation
                 if steps % a.validation_interval == 0:  # and steps != 0:
                     generator.eval()
+                    mpd.eval()
+                    msd.eval()
+                    mpd_watermark.eval()
+                    msd_watermark.eval()
                     torch.cuda.empty_cache()
                     val_err_tot = 0
+
+                    # Validation set metrics
+                    mpd_adversary_metrics = DiscriminatorMetrics()
+                    msd_adversary_metrics = DiscriminatorMetrics()
+                    mpd_collab_metrics = DiscriminatorMetrics()
+                    msd_collab_metrics = DiscriminatorMetrics()
+  
                     with torch.no_grad():
                         for j, batch in enumerate(validation_loader):
                             x, y, _, y_mel = batch
-                            # estimate lpc coefficients
-                            y_emph = generator.pre_emphasis.emphasis(y.to(device).unsqueeze(0))
-                            allpole = generator.lpc.estimate(y_emph[:, 0, :])
-                            # generate excitation
-                            e_g_hat = generator(x.to(device))
-                            # apply synthesis filter
-                            y_g_hat = generator.lpc.synthesis_filter(e_g_hat, allpole)
+                            y_g_hat = generator(x.to(device))
 
                             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
                             y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
@@ -256,7 +317,34 @@ def train(rank, a, h):
                                                           h.fmin, h.fmax_for_loss)
                             val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
+
                             # TODO: calculate discriminator EER
+                            y = torch.autograd.Variable(y.to(device, non_blocking=True))
+                            y = y.unsqueeze(1)
+
+                            y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat)
+                            mpd_adversary_metrics.accumulate(
+                                disc_real_outputs = y_df_hat_r,
+                                disc_generated_outputs = y_df_hat_g
+                            )
+
+                            y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat)
+                            msd_adversary_metrics.accumulate(
+                                disc_real_outputs = y_ds_hat_r,
+                                disc_generated_outputs = y_ds_hat_g
+                            )
+
+                            y_df_hat_r, y_df_hat_g, _, _ = mpd_watermark(y, y_g_hat)
+                            mpd_collab_metrics.accumulate(
+                                disc_real_outputs = y_df_hat_r,
+                                disc_generated_outputs = y_df_hat_g
+                            )
+
+                            y_ds_hat_r, y_ds_hat_g, _, _ = msd_watermark(y, y_g_hat)
+                            msd_collab_metrics.accumulate(
+                                disc_real_outputs = y_ds_hat_r,
+                                disc_generated_outputs = y_ds_hat_g
+                            )
 
                             if j <= 4:
                                 if steps == 0:
@@ -273,7 +361,17 @@ def train(rank, a, h):
                         val_err = val_err_tot / (j+1)
                         sw.add_scalar("validation/mel_spec_error", val_err, steps)
 
+                        sw.add_scalar("validation/mpd_adversary_accuracy", mpd_adversary_metrics.accuracy, steps)
+                        sw.add_scalar("validation/msd_adversary_accuracy", msd_adversary_metrics.accuracy, steps)
+                        sw.add_scalar("validation/mpd_collab_accuracy", mpd_collab_metrics.accuracy, steps)
+                        sw.add_scalar("validation/msd_collab_accuracy", msd_collab_metrics.accuracy, steps)
+
+
                     generator.train()
+                    mpd.train()
+                    msd.train()
+                    mpd_watermark.train()
+                    msd_watermark.train()
 
             steps += 1
 

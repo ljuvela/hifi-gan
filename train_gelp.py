@@ -16,7 +16,7 @@ from env import AttrDict, build_env
 from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
 from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
     discriminator_loss
-from models import discriminator_accuracy
+from models import discriminator_metrics
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
 
 
@@ -38,7 +38,7 @@ def train(rank, a, h):
     else:
         device = torch.device('cpu')
 
-    generator = Generator(h)
+    generator = Generator(h, input_channels=h.num_mels)
     generator.pre_emphasis = Emphasis(alpha=h.pre_emph_coeff).to(device)
     generator.lpc = LinearPredictor(
             n_fft=h.n_fft,
@@ -136,7 +136,7 @@ def train(rank, a, h):
 
             if rank == 0:
                 start_b = time.time()
-            x, y, _, y_mel = batch # mel, audio, filename, mel_loss
+            x, y, _, y_mel = batch # mel_conditioning, audio, filename, mel_ground_truth
             x = torch.autograd.Variable(x.to(device, non_blocking=True))
             y = torch.autograd.Variable(y.to(device, non_blocking=True))
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
@@ -159,12 +159,12 @@ def train(rank, a, h):
 
             # MPD
             y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
-            # discriminator_accuracy(y_df_hat_r, y_df_hat_g)
+            # discriminator_metrics(y_df_hat_r, y_df_hat_g)
             loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
 
             # MSD
             y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
-            # discriminator_accuracy(y_ds_hat_r, y_ds_hat_g)
+            # discriminator_metrics(y_ds_hat_r, y_ds_hat_g)
             loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
 
             loss_disc_all = loss_disc_s + loss_disc_f
