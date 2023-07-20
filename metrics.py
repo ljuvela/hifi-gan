@@ -1,78 +1,92 @@
 import torch
+import numpy as np
+
+
+def compute_det_curve(target_scores, nontarget_scores):
+
+    n_scores = target_scores.size + nontarget_scores.size
+    all_scores = np.concatenate((target_scores, nontarget_scores))
+    labels = np.concatenate((np.ones(target_scores.size), np.zeros(nontarget_scores.size)))
+
+    # Sort labels based on scores
+    indices = np.argsort(all_scores, kind='mergesort')
+    labels = labels[indices]
+
+    # Compute false rejection and false acceptance rates
+    tar_trial_sums = np.cumsum(labels)
+    nontarget_trial_sums = nontarget_scores.size - (np.arange(1, n_scores + 1) - tar_trial_sums)
+
+    frr = np.concatenate((np.atleast_1d(0), tar_trial_sums / target_scores.size))  # false rejection rates
+    far = np.concatenate((np.atleast_1d(1), nontarget_trial_sums / nontarget_scores.size))  # false acceptance rates
+    thresholds = np.concatenate((np.atleast_1d(all_scores[indices[0]] - 0.001), all_scores[indices]))  # Thresholds are the sorted scores
+
+    return frr, far, thresholds
+
+
+def compute_eer(target_scores, nontarget_scores):
+    """ Returns equal error rate (EER) and the corresponding threshold. """
+    frr, far, thresholds = compute_det_curve(target_scores, nontarget_scores)
+    abs_diffs = np.abs(frr - far)
+    min_index = np.argmin(abs_diffs)
+    eer = np.mean((frr[min_index], far[min_index]))
+    return eer, thresholds[min_index]
 
 
 class DiscriminatorMetrics():
 
     def __init__(self):
         
-        self.true_accept_total = 0
-        self.true_reject_total = 0
-        self.false_accept_total = 0
-        self.false_reject_total = 0
-        self.num_samples_total = 0
+        self._scores_real = []
+        self._scores_fake = []
+    
+    @property
+    def scores_real(self):
+        return torch.cat(self._scores_real, dim=0)
+    
+    @property
+    def scores_fake(self):
+        return torch.cat(self._scores_fake, dim=0)
+
+    @property
+    def eer(self):
+        scores_real = self.scores_real.detach().cpu().numpy()
+        scores_fake = self.scores_fake.detach().cpu().numpy()
+        eer, thresholds = compute_eer(scores_real, scores_fake)
+        return eer
 
     @property
     def accuracy(self):
-        TA = self.true_accept_total
-        TR = self.true_reject_total
-        N = self.num_samples_total
-        return 1.0 * (TA + TR) / N
+        return 1.0 - self.eer
 
-    @property
-    def false_accept_rate(self):
-        return 1.0 * self.false_accept_total / self.num_samples_total
 
-    @property
-    def false_reject_rate(self):
-        return 1.0 * self.false_reject_total / self.num_samples_total
-
-    @property
-    def equal_error_rate(self):
-        return 0.5 * (self.false_rec)
-
-    def accumulate(self, disc_real_outputs, disc_generated_outputs):
+    def accumulate(self, disc_real_outputs, disc_fake_outputs):
         """ 
         Args:
             disc_real_outputs: 
                 shape is (batch, channels, timesteps)
-            disc_generated_outputs
+            disc_fake_outputs
                 shape is (batch, channels, timesteps)
         """
-        pred_real = []
-        pred_gen = []
+      
+        scores_real = []
+        scores_fake = []
         # classifications for each discriminator
-        for d_real, d_gen in zip(disc_real_outputs, disc_generated_outputs):
+        for d_real, d_fake in zip(disc_real_outputs, disc_fake_outputs):
             # mean prediction over time and channels
-            pred_real.append(torch.mean(d_real, dim=(-1,)) > 0.5)
-            pred_gen.append(torch.mean(d_gen, dim=(-1,)) < 0.5)
+            scores_real.append(torch.mean(d_real, dim=(-1,)))
+            scores_fake.append(torch.mean(d_fake, dim=(-1,)))
 
-        # Stack classifications from different discriminators
-        pred_real = torch.stack(pred_real, dim=0)
-        pred_gen = torch.stack(pred_gen, dim=0)
+        # Stack scores from different discriminators
+        scores_real = torch.stack(scores_real, dim=1) # -> (batch, num_discriminators)
+        scores_fake = torch.stack(scores_fake, dim=1) # -> (batch, num_discriminators)
 
-        # Majority vote (probabilites not available)
-        pred_real_voted, _ = torch.median(pred_real * 1.0, dim=-1)
-        pred_gen_voted, _ = torch.median(pred_gen * 1.0, dim=-1)
+        # Voting by averaging scores
+        scores_real_voted = torch.mean(scores_real, dim=-1) # -> (batch,)
+        scores_fake_voted = torch.mean(scores_fake, dim=-1) # -> (batch,)
 
-        if pred_real_voted.shape != pred_gen_voted.shape:
+        if scores_real_voted.shape != scores_fake_voted.shape:
             raise ValueError("Real and generated batch sizes must match")
+        
+        self._scores_real.append(scores_real_voted)
+        self._scores_fake.append(scores_fake_voted)
 
-        N = pred_real_voted.shape[0] + pred_gen_voted.shape[0]
-
-        # True Accept
-        TA = pred_real_voted.sum() 
-
-        # True Reject
-        TR = pred_gen_voted.sum()
-
-        # False Accept
-        FA = N - TR
-
-        # False Reject
-        FR = N - TA
-
-        self.true_accept_total += TA
-        self.true_reject_total += TR
-        self.false_accept_total += FA
-        self.false_reject_total += FR
-        self.num_samples_total += N

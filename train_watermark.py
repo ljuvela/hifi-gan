@@ -99,7 +99,7 @@ def train(rank, a, h):
         optim_d.load_state_dict(state_dict_do['optim_d'])
 
     if state_dict_do_wm is not None:
-        optim_d_wm.load_state_dict[state_dict_do_wm[['optim_d']]]
+        optim_d_wm.load_state_dict(state_dict_do_wm['optim_d'])
     elif last_epoch > -1:
         for pg in optim_d_wm.param_groups:
             pg['initial_lr'] = pg['lr']
@@ -325,25 +325,26 @@ def train(rank, a, h):
                             y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat)
                             mpd_adversary_metrics.accumulate(
                                 disc_real_outputs = y_df_hat_r,
-                                disc_generated_outputs = y_df_hat_g
+                                disc_fake_outputs = y_df_hat_g
                             )
+
 
                             y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat)
                             msd_adversary_metrics.accumulate(
                                 disc_real_outputs = y_ds_hat_r,
-                                disc_generated_outputs = y_ds_hat_g
+                                disc_fake_outputs = y_ds_hat_g
                             )
 
                             y_df_hat_r, y_df_hat_g, _, _ = mpd_watermark(y, y_g_hat)
                             mpd_collab_metrics.accumulate(
                                 disc_real_outputs = y_df_hat_r,
-                                disc_generated_outputs = y_df_hat_g
+                                disc_fake_outputs = y_df_hat_g
                             )
 
                             y_ds_hat_r, y_ds_hat_g, _, _ = msd_watermark(y, y_g_hat)
                             msd_collab_metrics.accumulate(
                                 disc_real_outputs = y_ds_hat_r,
-                                disc_generated_outputs = y_ds_hat_g
+                                disc_fake_outputs = y_ds_hat_g
                             )
 
                             if j <= 4:
@@ -365,6 +366,11 @@ def train(rank, a, h):
                         sw.add_scalar("validation/msd_adversary_accuracy", msd_adversary_metrics.accuracy, steps)
                         sw.add_scalar("validation/mpd_collab_accuracy", mpd_collab_metrics.accuracy, steps)
                         sw.add_scalar("validation/msd_collab_accuracy", msd_collab_metrics.accuracy, steps)
+
+                        sw.add_scalar("validation/mpd_adversary_equal_error_rate", mpd_adversary_metrics.eer, steps)
+                        sw.add_scalar("validation/msd_adversary_equal_error_rate", msd_adversary_metrics.eer, steps)
+                        sw.add_scalar("validation/mpd_collab_equal_error_rate", mpd_collab_metrics.eer, steps)
+                        sw.add_scalar("validation/msd_collab_equal_error_rate", msd_collab_metrics.eer, steps)
 
 
                     generator.train()
