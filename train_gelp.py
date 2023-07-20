@@ -16,12 +16,18 @@ from env import AttrDict, build_env
 from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
 from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
     discriminator_loss
+from models import discriminator_metrics
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
+
+
+from glotnet.sigproc.lpc import LinearPredictor
+from glotnet.sigproc.emphasis import Emphasis
 
 torch.backends.cudnn.benchmark = True
 
 
 def train(rank, a, h):
+
     if h.num_gpus > 1:
         init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
                            world_size=h.dist_config['world_size'] * h.num_gpus, rank=rank)
@@ -32,7 +38,14 @@ def train(rank, a, h):
     else:
         device = torch.device('cpu')
 
-    generator = Generator(h).to(device)
+    generator = Generator(h, input_channels=h.num_mels)
+    generator.pre_emphasis = Emphasis(alpha=h.pre_emph_coeff).to(device)
+    generator.lpc = LinearPredictor(
+            n_fft=h.n_fft,
+            hop_length=h.hop_size,
+            win_length=h.win_size,
+            order=h.allpole_order)
+    generator = generator.to(device)
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
 
@@ -102,10 +115,16 @@ def train(rank, a, h):
 
         sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
 
+
     generator.train()
     mpd.train()
     msd.train()
+
+    # generator = torch.compile(generator)
+    # mpd = torch.compile(mpd)
+    # msd = torch.compile(msd)
     for epoch in range(max(0, last_epoch), a.training_epochs):
+
         if rank == 0:
             start = time.time()
             print("Epoch: {}".format(epoch+1))
@@ -114,29 +133,38 @@ def train(rank, a, h):
             train_sampler.set_epoch(epoch)
 
         for i, batch in enumerate(train_loader):
+
             if rank == 0:
                 start_b = time.time()
-            x, y, _, y_mel = batch # mel, audio, filename, mel_loss
+            x, y, _, y_mel = batch # mel_conditioning, audio, filename, mel_ground_truth
             x = torch.autograd.Variable(x.to(device, non_blocking=True))
             y = torch.autograd.Variable(y.to(device, non_blocking=True))
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
             y = y.unsqueeze(1)
 
-            # TODO: add LPC parameter estimation
+            # estimate lpc coefficients
+            y_emph = generator.pre_emphasis.emphasis(y)
+            allpole = generator.lpc.estimate(y_emph[:, 0, :])
+            # generate excitation
+            e_g_hat = generator(x)
+            # apply synthesis filter
+            y_g_hat = generator.lpc.synthesis_filter(e_g_hat, allpole)
 
-            y_g_hat = generator(x)
-            # TODO: add glotnet synthesis filter
-            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
+            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft,
+                                          h.num_mels, h.sampling_rate,
+                                          h.hop_size, h.win_size,
                                           h.fmin, h.fmax_for_loss)
 
             optim_d.zero_grad()
 
             # MPD
             y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
+            # discriminator_metrics(y_df_hat_r, y_df_hat_g)
             loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
 
             # MSD
             y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
+            # discriminator_metrics(y_ds_hat_r, y_ds_hat_g)
             loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
 
             loss_disc_all = loss_disc_s + loss_disc_f
@@ -188,6 +216,20 @@ def train(rank, a, h):
                 if steps % a.summary_interval == 0:
                     sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
                     sw.add_scalar("training/mel_spec_error", mel_error, steps)
+                    # Framed Discriminator losses
+                    sw.add_scalar("training_gan/disc_f_r", sum(losses_disc_f_r), steps)
+                    sw.add_scalar("training_gan/disc_f_g", sum(losses_disc_f_g), steps)
+                    # Multiscale Discriminator losses
+                    sw.add_scalar("training_gan/disc_s_r", sum(losses_disc_s_r), steps)
+                    sw.add_scalar("training_gan/disc_s_g", sum(losses_disc_s_g), steps)
+                    # Framed Generator losses
+                    sw.add_scalar("training_gan/gen_f", sum(losses_gen_f), steps)
+                    # Multiscale Generator losses
+                    sw.add_scalar("training_gan/gen_s", sum(losses_gen_s), steps)
+                    # Feature Matching losses
+                    sw.add_scalar("training_gan/loss_fm_f", loss_fm_f, steps)
+                    sw.add_scalar("training_gan/loss_fm_s", loss_fm_s, steps)
+
 
                 # Validation
                 if steps % a.validation_interval == 0:  # and steps != 0:
@@ -197,12 +239,21 @@ def train(rank, a, h):
                     with torch.no_grad():
                         for j, batch in enumerate(validation_loader):
                             x, y, _, y_mel = batch
-                            y_g_hat = generator(x.to(device))
+                            # estimate lpc coefficients
+                            y_emph = generator.pre_emphasis.emphasis(y.to(device).unsqueeze(0))
+                            allpole = generator.lpc.estimate(y_emph[:, 0, :])
+                            # generate excitation
+                            e_g_hat = generator(x.to(device))
+                            # apply synthesis filter
+                            y_g_hat = generator.lpc.synthesis_filter(e_g_hat, allpole)
+
                             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
                             y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
                                                           h.hop_size, h.win_size,
                                                           h.fmin, h.fmax_for_loss)
                             val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
+
+                            # TODO: calculate discriminator EER
 
                             if j <= 4:
                                 if steps == 0:
@@ -248,6 +299,7 @@ def main():
     parser.add_argument('--summary_interval', default=100, type=int)
     parser.add_argument('--validation_interval', default=1000, type=int)
     parser.add_argument('--fine_tuning', default=False, type=bool)
+    parser.add_argument('--wavefile_ext', default='.wav', type=str)
 
     a = parser.parse_args()
 

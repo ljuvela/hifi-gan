@@ -6,7 +6,6 @@ import numpy as np
 import argparse
 import json
 import torch
-from scipy.io.wavfile import write
 from env import AttrDict
 from meldataset import MAX_WAV_VALUE
 from models import Generator
