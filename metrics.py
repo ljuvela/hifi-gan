@@ -63,9 +63,9 @@ class DiscriminatorMetrics():
         """ 
         Args:
             disc_real_outputs: 
-                shape is (batch, channels, timesteps)
+                shape is [(batch, timesteps)] * num_models
             disc_fake_outputs
-                shape is (batch, channels, timesteps)
+                shape is [(batch, timesteps)] * num_models
         """
       
         scores_real = []
